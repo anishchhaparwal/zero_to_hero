@@ -4,10 +4,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from transformers import GPT2LMHeadModel
 import math
-
-device="cpu"
-if torch.cuda.is_available():
-    device="cuda"
+import tiktoken
 
 @dataclass
 class GPTConfig:
@@ -16,7 +13,6 @@ class GPTConfig:
     n_layer:int = 12 # no of attention block
     n_head:int = 12 # attention head
     n_embd:int = 768 # embedding size
-    
     
 class CausalAttention(nn.Module):
     def __init__(self, config):
@@ -89,7 +85,7 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         
-    def forward(self, idx):
+    def forward(self, idx, targets = None):
         B, T = idx.size()
         assert T <= self.config.block_size, f"T cannot be greater than block size"
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
@@ -103,7 +99,11 @@ class GPT(nn.Module):
         
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
-        return logits
+        
+        loss=None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1,logits.size(-1)), targets.view(-1))
+        return logits, loss
     
     @classmethod
     def from_pretrained(cls, model_type):
@@ -150,33 +150,58 @@ class GPT(nn.Module):
         return model
 
 # ------------------------------------------------
-model = GPT.from_pretrained('gpt2')
+device="cpu"
+if torch.cuda.is_available():
+    device="cuda"
+    
+with open('input.txt', 'r', encoding='utf-8') as f:
+    text = f.read()
+
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode(text)
+B, T = 4, 32
+buf = torch.tensor(tokens[:B*T+1], dtype=torch.long, device=device)
+x = buf[:-1].view(B, T)
+y = buf[1:].view(B, T)
+
+# model = GPT.from_pretrained('gpt2')
+model = GPT(GPTConfig())
 model.eval()
 model.to(device)
 
-resampling_count = 5
-max_sample_length=30
-import tiktoken
-enc=tiktoken.get_encoding('gpt2')
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat(resampling_count, 1)
-print(f"shape of tokens {tokens.shape}")
-x = tokens.to(device)
+optimizer = torch.optim.AdamW(model.parameters(),lr=3e-4)
+for i in range(50):
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f" step {i}, loss: {loss.item()}")
 
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-while x.size(1) < max_sample_length:
-    with torch.no_grad():
-        logits = model(x)
-        last_timestamp = logits[:,-1,:]
-        probs = F.softmax(last_timestamp, dim=-1)
-        topk_probs, topk_indices = torch.topk(probs, 50,-1)
-        ix = torch.multinomial(topk_probs,1)
-        xcol = torch.gather(topk_indices, -1, ix)
-        x = torch.cat((x,xcol), dim=1)
+
+
+# resampling_count = 5
+# max_sample_length=30
+# import tiktoken 
+# enc=tiktoken.get_encoding('gpt2')
+# tokens = enc.encode("Hello, I'm a language model,")
+# tokens = torch.tensor(tokens, dtype=torch.long)
+# tokens = tokens.unsqueeze(0).repeat(resampling_count, 1)
+# print(f"shape of tokens {tokens.shape}")
+# x = tokens.to(device)
+
+# torch.manual_seed(42)
+# torch.cuda.manual_seed(42)
+# while x.size(1) < max_sample_length:
+#     with torch.no_grad():
+#         logits = model(x)
+#         last_timestamp = logits[:,-1,:]
+#         probs = F.softmax(last_timestamp, dim=-1)
+#         topk_probs, topk_indices = torch.topk(probs, 50,-1)
+#         ix = torch.multinomial(topk_probs,1)
+#         xcol = torch.gather(topk_indices, -1, ix)
+#         x = torch.cat((x,xcol), dim=1)
         
-for i in range(resampling_count):
-    tokens = x[i,:max_sample_length].tolist()
-    decode = enc.decode(tokens)
-    print(f"> {decode}")
+# for i in range(resampling_count):
+#     tokens = x[i,:max_sample_length].tolist()
+#     decode = enc.decode(tokens)
+#     print(f"> {decode}")
