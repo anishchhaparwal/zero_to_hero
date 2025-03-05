@@ -5,6 +5,7 @@ from torch.nn import functional as F
 from transformers import GPT2LMHeadModel
 import math
 import tiktoken
+import time 
 
 @dataclass
 class GPTConfig:
@@ -24,6 +25,7 @@ class CausalAttention(nn.Module):
         
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.gpt2__init = 1
         # this is masked encoding so model doesnt have context from future. using bias to follow naming convetion from openai.
         self.register_buffer('bias', torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
     
@@ -50,6 +52,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.gpt2__init = 1
     
     def forward(self, x):
         x = self.c_fc(x)
@@ -84,6 +87,23 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        
+        # input and logits embedding should be same. same input distribution, same output distribution.
+        self.transformer.wte.weight = self.lm_head.weight
+        
+        # init params:
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'gpt2__init'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
         
     def forward(self, idx, targets = None):
         B, T = idx.size()
@@ -154,29 +174,76 @@ device="cpu"
 if torch.cuda.is_available():
     device="cuda"
     
-with open('input.txt', 'r', encoding='utf-8') as f:
-    text = f.read()
 
-enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode(text)
-B, T = 4, 32
-buf = torch.tensor(tokens[:B*T+1], dtype=torch.long, device=device)
-x = buf[:-1].view(B, T)
-y = buf[1:].view(B, T)
 
-# model = GPT.from_pretrained('gpt2')
+# dataloader
+class Dataloaderlite():
+    def __init__(self, batch, block_size):
+        self.B = batch
+        self.T = block_size
+        
+        with open('input.txt', 'r', encoding='utf-8') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens, device=device)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {(len(self.tokens) // (self.B * self.T))} batches")
+
+        self.current_position = 0
+        
+    def next_batch(self):
+        buf = self.tokens[self.current_position: self.current_position + self.B * self.T + 1]
+        x = buf[:-1].view(self.B, self.T)
+        y = buf[1:].view(self.B, self.T)
+        
+        self.current_position += self.B * self.T 
+        
+        if self.current_position + (self.B * self.T + 1) > len(self.tokens):
+            self.current_position = 0
+        return x, y         
+# -----------------------------------------
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+# model init
 model = GPT(GPTConfig())
 model.eval()
 model.to(device)
+model = torch.compile(model, mode="reduce-overhead")
 
 optimizer = torch.optim.AdamW(model.parameters(),lr=3e-4)
+data = Dataloaderlite(batch=8, block_size=1024)
+torch.set_float32_matmul_precision('high')
+
+
+
+# training steps
 for i in range(50):
+    t0=time.time()
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    x, y = data.next_batch()
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
+        # import code; code.interact(local=locals())
     loss.backward()
     optimizer.step()
-    print(f" step {i}, loss: {loss.item()}")
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000 # time diff in ms
+    tokens_per_second = (data.B * data.T) / (t1 - t0) 
+    print(f" step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_second:.2f}")
 
+# model = model.to('cpu')
+# del model
+# torch.cuda.empty_cache()
+# print(torch.__version__)
+# import sys;
+# sys.stdout.flush()
+# sys.stderr.flush()
+# sys.exit(0)
 
 
 # resampling_count = 5
