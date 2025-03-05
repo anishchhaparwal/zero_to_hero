@@ -6,11 +6,12 @@ from transformers import GPT2LMHeadModel
 import math
 import tiktoken
 import time 
+import inspect
 
 @dataclass
 class GPTConfig:
     block_size:int = 1024
-    vocab_size:int = 50257
+    vocab_size:int = 50257  # ugly number we want to replace with a power of 2. eg: 50304  
     n_layer:int = 12 # no of attention block
     n_head:int = 12 # attention head
     n_embd:int = 768 # embedding size
@@ -37,12 +38,16 @@ class CausalAttention(nn.Module):
         k = k.view(B, T, self.n_head, C//self.n_head).transpose(1,2)
         v = v.view(B, T, self.n_head, C//self.n_head).transpose(1,2)
         
-        attn = (q @ k.transpose(-2,-1))*(1.0/math.sqrt(k.size(-1))) # (B, n_head, T, n_embd/n_heads) @ (B, n_head,  n_embd/n_heads, T) = (B, n_head, T, T)
-        attn = attn.masked_fill(self.bias[:,:,:T,:T]==0,float('-inf'))
-        attn = F.softmax(attn, dim=-1)
-        y = attn @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1,2).contiguous().view(B,T,C)
+        # flash attention to speed up. torch.compile currently doesnt optamize this. it should.
+        # y = F.scaled_dot_product_attention(q, k, v, attn_mask=self.bias[:,:,:T,:T], dropout_p=0.0)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         
+        # attn = (q @ k.transpose(-2,-1))*(1.0/math.sqrt(k.size(-1))) # (B, n_head, T, n_embd/n_heads) @ (B, n_head,  n_embd/n_heads, T) = (B, n_head, T, T)
+        # attn = attn.masked_fill(self.bias[:,:,:T,:T]==0,float('-inf'))
+        # attn = F.softmax(attn, dim=-1)
+        # y = attn @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        
+        y = y.transpose(1,2).contiguous().view(B,T,C)
         y = self.c_proj(y)
         return y        
         
@@ -169,13 +174,25 @@ class GPT(nn.Module):
 
         return model
 
-# ------------------------------------------------
-device="cpu"
-if torch.cuda.is_available():
-    device="cuda"
+    def configure_optimizer(self, weight_decay, learning_rate, device):
+        # all paramas that require grad
+        param_dict = {pn:p for pn,p in self.named_parameters() if p.requires_grad}
+        
+        # we want to decay all embedding and matmuls w+b but not for layernorm.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nondecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nondecay_params, 'weight_decay':  0.0}
+        ]
+        # used fused which should be used by default to speed things up but not always available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters  
+        
+        print(f"num decayed: {sum(p.numel() for p in decay_params):,} | num non-decayed: {sum(p.numel() for p in nondecay_params):,} | setting fused in optim to: {fused_available}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9,0.95), eps=1e-8, fused=fused_available)
+        return optimizer
     
-
-
+# -----------------------------------------
 # dataloader
 class Dataloaderlite():
     def __init__(self, batch, block_size):
@@ -203,44 +220,73 @@ class Dataloaderlite():
             self.current_position = 0
         return x, y         
 # -----------------------------------------
+# get_lr
 
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10 # 715
+max_steps = 50 # 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+def get_lr(it):
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps
+    # 2) if it > lr_decay_iters, return min learning rate
+    if it > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
+
+# -----------------------------------------
+torch.set_float32_matmul_precision('high')
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
+device="cpu"
+if torch.cuda.is_available():
+    device="cuda"
+
 # model init
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.eval()
 model.to(device)
-model = torch.compile(model, mode="reduce-overhead")
+model = torch.compile(model)
 
-optimizer = torch.optim.AdamW(model.parameters(),lr=3e-4)
-data = Dataloaderlite(batch=8, block_size=1024)
-torch.set_float32_matmul_precision('high')
+data = Dataloaderlite(batch=16, block_size=1024)
 
-
+# optimizer = torch.optim.AdamW(model.parameters(),lr = 3e-4, betas=(0.9,0.95), eps=1e-8)
+optimizer = model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)
 
 # training steps
-for i in range(50):
+for step in range(max_steps):
     t0=time.time()
     optimizer.zero_grad()
     x, y = data.next_batch()
     with torch.autocast(device_type=device, dtype=torch.bfloat16):
         logits, loss = model(x, y)
-        # import code; code.interact(local=locals())
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+    # determining lr
+    lr = get_lr(step)
+    for param in optimizer.param_groups:
+        param['lr'] = lr
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000 # time diff in ms
     tokens_per_second = (data.B * data.T) / (t1 - t0) 
-    print(f" step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_second:.2f}")
+    print(f" step {step} | loss: {loss.item()} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}")
 
+print("bye")
 # model = model.to('cpu')
 # del model
 # torch.cuda.empty_cache()
 # print(torch.__version__)
-# import sys;
+# import sys;``
 # sys.stdout.flush()
 # sys.stderr.flush()
 # sys.exit(0)
