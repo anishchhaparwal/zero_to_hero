@@ -1,12 +1,16 @@
 from dataclasses import dataclass
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-from transformers import GPT2LMHeadModel
 import math
 import tiktoken
 import time 
 import inspect
+import os
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+from transformers import GPT2LMHeadModel
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
 @dataclass
 class GPTConfig:
@@ -188,16 +192,18 @@ class GPT(nn.Module):
         # used fused which should be used by default to speed things up but not always available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters  
         
-        print(f"num decayed: {sum(p.numel() for p in decay_params):,} | num non-decayed: {sum(p.numel() for p in nondecay_params):,} | setting fused in optim to: {fused_available}")
+        # print(f"num decayed: {sum(p.numel() for p in decay_params):,} | num non-decayed: {sum(p.numel() for p in nondecay_params):,} | setting fused in optim to: {fused_available}")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9,0.95), eps=1e-8, fused=fused_available)
         return optimizer
     
 # -----------------------------------------
 # dataloader
 class Dataloaderlite():
-    def __init__(self, batch, block_size):
+    def __init__(self, batch, block_size, global_rank_of_gpu, total_gpu_across_cluster):
         self.B = batch
         self.T = block_size
+        self.global_rank_of_gpu = global_rank_of_gpu
+        self.total_gpu_across_cluster = total_gpu_across_cluster
         
         with open('input.txt', 'r', encoding='utf-8') as f:
             text = f.read()
@@ -207,18 +213,56 @@ class Dataloaderlite():
         print(f"loaded {len(self.tokens)} tokens")
         print(f"1 epoch = {(len(self.tokens) // (self.B * self.T))} batches")
 
-        self.current_position = 0
+        self.current_position = self.B * self.T * self.global_rank_of_gpu
         
     def next_batch(self):
         buf = self.tokens[self.current_position: self.current_position + self.B * self.T + 1]
         x = buf[:-1].view(self.B, self.T)
         y = buf[1:].view(self.B, self.T)
         
-        self.current_position += self.B * self.T 
+        self.current_position += self.B * self.T * self.total_gpu_across_cluster
         
-        if self.current_position + (self.B * self.T + 1) > len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (self.B * self.T * self.total_gpu_across_cluster +  1) > len(self.tokens):
+            self.current_position = self.B * self.T * self.global_rank_of_gpu
         return x, y         
+
+# -----------------------------------------
+# DDP, Device, Seed
+torch.set_float32_matmul_precision('high')
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+# set up DDP (distributed data parallel).
+# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK']) # global rank of the process across all nodes and GPUs in the distributed setup
+    ddp_local_rank = int(os.environ['LOCAL_RANK']) # in the node which gpu are we refering too
+    ddp_world_size = int(os.environ['WORLD_SIZE']) # total no of gpus across nodes and multiple cards
+    device = f'cuda:{ddp_local_rank}' # Assign GPU based on local rank
+    torch.cuda.set_device(device) # Set the current CUDA device
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
+
+# added after video, pytorch can be serious about it's device vs. device_type distinction
+device_type = "cuda" if device.startswith("cuda") else "cpu"
+
 # -----------------------------------------
 # get_lr
 
@@ -240,30 +284,29 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 # -----------------------------------------
-torch.set_float32_matmul_precision('high')
-torch.manual_seed(1337)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(1337)
-
-device="cpu"
-if torch.cuda.is_available():
-    device="cuda"
-
 # model init
 model = GPT(GPTConfig(vocab_size=50304))
 model.eval()
 model.to(device)
 model = torch.compile(model)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
 
-total_batch_size  = 2**19
+total_batch_size  = 540672 #2**19
 no_of_eg = 16
 context_window = 1024
-assert total_batch_size % (no_of_eg * context_window) == 0, "make total_batch_size divisible by no_of_eg * context_window"
-grad_accum_steps = total_batch_size // (no_of_eg * context_window)
-data = Dataloaderlite(batch=16, block_size=1024)
+assert total_batch_size % (no_of_eg * context_window * ddp_world_size) == 0, "make total_batch_size divisible by no_of_eg * context_window * ddp_world_size"
+grad_accum_steps = total_batch_size // (no_of_eg * context_window * ddp_world_size)
+if master_process:
+    print(f"total batch size: {total_batch_size}. Total grad accum steps: {grad_accum_steps}")  
+# print(f"gpu rank: {ddp_rank}")
+
+data = Dataloaderlite(batch=16, block_size=1024, global_rank_of_gpu= ddp_rank, total_gpu_across_cluster = ddp_world_size)
+ 
 
 # optimizer = torch.optim.AdamW(model.parameters(),lr = 3e-4, betas=(0.9,0.95), eps=1e-8)
-optimizer = model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)
+optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)
 
 # training steps
 for step in range(max_steps):
@@ -276,8 +319,12 @@ for step in range(max_steps):
             logits, loss = model(x, y)
         loss = loss /grad_accum_steps # we do this because in normal F.cross_entropy we take the mean value. here we are accumulating across multiple batches so we devide by no of step we are accumunating by,
         loss_accum += loss.detach()
+        if ddp: # syncing loss across all gpu in all nodes only on grad_accum_steps -1 steps and not every step. 
+            model.require_backward_grad_sync = (micro_step == (grad_accum_steps -1))
         loss.backward()
-    
+
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
     # determining lr
@@ -288,10 +335,14 @@ for step in range(max_steps):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000 # time diff in ms
-    tokens_processed = data.B * data.T * grad_accum_steps
-    tokens_per_second = tokens_processed / (t1 - t0) 
-    print(f" step {step} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}")
+    tokens_processed = data.B * data.T * grad_accum_steps * ddp_world_size
+    tokens_per_second = tokens_processed / (t1 - t0)
+    if master_process: 
+        print(f" step {step} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}")
 
+if ddp:
+    destroy_process_group()
+    
 print("bye")
 # model = model.to('cpu')
 # del model
