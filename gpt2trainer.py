@@ -255,6 +255,11 @@ model.eval()
 model.to(device)
 model = torch.compile(model)
 
+total_batch_size  = 2**19
+no_of_eg = 16
+context_window = 1024
+assert total_batch_size % (no_of_eg * context_window) == 0, "make total_batch_size divisible by no_of_eg * context_window"
+grad_accum_steps = total_batch_size // (no_of_eg * context_window)
 data = Dataloaderlite(batch=16, block_size=1024)
 
 # optimizer = torch.optim.AdamW(model.parameters(),lr = 3e-4, betas=(0.9,0.95), eps=1e-8)
@@ -264,10 +269,15 @@ optimizer = model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, devi
 for step in range(max_steps):
     t0=time.time()
     optimizer.zero_grad()
-    x, y = data.next_batch()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = data.next_batch()
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss = loss /grad_accum_steps # we do this because in normal F.cross_entropy we take the mean value. here we are accumulating across multiple batches so we devide by no of step we are accumunating by,
+        loss_accum += loss.detach()
+        loss.backward()
+    
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
     # determining lr
@@ -278,8 +288,9 @@ for step in range(max_steps):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000 # time diff in ms
-    tokens_per_second = (data.B * data.T) / (t1 - t0) 
-    print(f" step {step} | loss: {loss.item()} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}")
+    tokens_processed = data.B * data.T * grad_accum_steps
+    tokens_per_second = tokens_processed / (t1 - t0) 
+    print(f" step {step} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}")
 
 print("bye")
 # model = model.to('cpu')
