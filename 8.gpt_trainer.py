@@ -11,8 +11,6 @@ from transformers import GPT2LMHeadModel
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-from torch.utils.data import Dataset, DataLoader, IterableDataset
-import numpy as np
 
 @dataclass
 class GPTConfig:
@@ -200,174 +198,33 @@ class GPT(nn.Module):
     
 # -----------------------------------------
 # dataloader
-# class Dataloaderlite():
-#     def __init__(self, batch, block_size, global_rank_of_gpu, total_gpu_across_cluster):
-#         self.B = batch
-#         self.T = block_size
-#         self.global_rank_of_gpu = global_rank_of_gpu
-#         self.total_gpu_across_cluster = total_gpu_across_cluster
+class Dataloaderlite():
+    def __init__(self, batch, block_size, global_rank_of_gpu, total_gpu_across_cluster):
+        self.B = batch
+        self.T = block_size
+        self.global_rank_of_gpu = global_rank_of_gpu
+        self.total_gpu_across_cluster = total_gpu_across_cluster
         
-#         with open('input.txt', 'r', encoding='utf-8') as f:
-#             text = f.read()
-#         enc = tiktoken.get_encoding('gpt2')
-#         tokens = enc.encode(text)
-#         self.tokens = torch.tensor(tokens, device=device)
-#         print(f"loaded {len(self.tokens)} tokens")
-#         print(f"1 epoch = {(len(self.tokens) // (self.B * self.T))} batches")
+        with open('input.txt', 'r', encoding='utf-8') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens, device=device)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {(len(self.tokens) // (self.B * self.T))} batches")
 
-#         self.current_position = self.B * self.T * self.global_rank_of_gpu
+        self.current_position = self.B * self.T * self.global_rank_of_gpu
         
-#     def next_batch(self):
-#         buf = self.tokens[self.current_position: self.current_position + self.B * self.T + 1]
-#         x = buf[:-1].view(self.B, self.T)
-#         y = buf[1:].view(self.B, self.T)
-        
-#         self.current_position += self.B * self.T * self.total_gpu_across_cluster
-        
-#         if self.current_position + (self.B * self.T * self.total_gpu_across_cluster +  1) > len(self.tokens):
-#             self.current_position = self.B * self.T * self.global_rank_of_gpu
-#         return x, y         
-
-class FineWebIterableDataset(IterableDataset):
-    """PyTorch IterableDataset for FineWeb data that yields batches continuously."""
-    
-    def __init__(self, data_dir, batch_size, block_size, 
-                 process_id, num_processes, split='train'):
-        super().__init__()
-        self.data_dir = data_dir
-        self.split = split
-        self.batch_size = batch_size
-        self.block_size = block_size
-        self.process_id = process_id
-        self.num_processes = num_processes
-        
-        # Get shard filenames
-        shards = [f for f in os.listdir(data_dir) if split in f and f.endswith('.npy')]
-        self.shards = sorted([os.path.join(data_dir, s) for s in shards])
-        
-        assert len(self.shards) > 0, f"No shards found for split {split} in {data_dir}"
-        if process_id == 0:
-            print(f"Found {len(self.shards)} shards for split {split}")
-    
-    def __iter__(self):
-        # Handle worker_info for DataLoader's multiprocessing
-        worker_info = torch.utils.data.get_worker_info()
-        
-        if worker_info is None:  # single-process loading
-            worker_id = 0
-            num_workers = 1
-        else:  # multi-process loading
-            worker_id = worker_info.id
-            num_workers = worker_info.num_workers
-        
-        # Calculate the effective process ID and total processes
-        effective_process_id = self.process_id * num_workers + worker_id
-        effective_num_processes = self.num_processes * num_workers # previously only one gpu. now each gpu has multiple num_processes so we move those many blocks ahead.
-        
-        # Initial state
-        shard_idx = 0
-        tokens = np.load(self.shards[shard_idx], mmap_mode='r')
-        position = self.batch_size * self.block_size * effective_process_id
-        
-        while True:
-            B, T = self.batch_size, self.block_size
-            
-            # Check if we need to load the next shard
-            if position + (B * T + 1) > len(tokens):
-                shard_idx = (shard_idx + 1) % len(self.shards)
-                tokens = np.load(self.shards[shard_idx], mmap_mode='r')
-                position = B * T * effective_process_id
-            
-            # Get batch of tokens
-            buf_np = tokens[position:position + B*T + 1]
-            
-            # Sanity check - should rarely happen
-            if len(buf_np) < B*T + 1:
-                shard_idx = (shard_idx + 1) % len(self.shards)
-                tokens = np.load(self.shards[shard_idx], mmap_mode='r')
-                position = B * T * effective_process_id
-                continue
-            
-            # Convert to PyTorch tensor
-            buf = torch.tensor(buf_np, dtype=torch.long)
-            
-            # Create input and target batches (B, T)
-            x = buf[:-1].reshape(B, T)
-            y = buf[1:].reshape(B, T)
-            
-            yield x, y
-            
-            # Advance position for next batch, respecting distributed processes
-            position += B * T * effective_num_processes
-
-
-class DataLoaderLitePyTorch:
-    """
-    Drop-in replacement for DataLoaderLite using PyTorch DataLoader.
-    
-    Features:
-    - Uses PyTorch's efficient DataLoader with multi-processing
-    - Memory maps files to reduce RAM usage
-    - Pin memory for faster CPU->GPU transfer
-    - Automatic shard preloading
-    """
-    
-    def __init__(self, B, T, process_rank, num_processes, split="train", 
-                 data_dir="/cache/fast_data_nas8/llm_setup_dataset/fineweb_10b", num_workers=2):
-        """
-        Args:
-            B: Batch size
-            T: Sequence length (context length)
-            process_rank: Process rank for distributed training
-            num_processes: Number of processes for distributed training
-            split: 'train' or 'val'
-            data_dir: Directory containing the data shards
-            num_workers: Number of DataLoader workers for parallel loading
-        """
-        self.B = B
-        self.T = T
-        self.split = split
-        
-        # Create dataset
-        dataset = FineWebIterableDataset(
-            data_dir=data_dir,
-            split=split,
-            batch_size=B,
-            block_size=T,
-            process_id=process_rank,
-            num_processes=num_processes
-        )
-        
-        # Create dataloader with PyTorch's parallel loading capabilities
-        self.dataloader = DataLoader(
-            dataset,
-            batch_size=None,  # Already batched in dataset
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
-            # worker_init_fn=worker_init_fn,
-            prefetch_factor=2 if num_workers > 0 else None
-        )
-        
-        # Initialize iterator
-        self.reset()
-    
     def next_batch(self):
-        """Get the next batch of data, matching original DataLoaderLite interface."""
-        try:
-            return next(self.iterator)
-        except StopIteration:
-            # This should rarely happen with our infinite IterableDataset
-            self.reset()
-            return next(self.iterator)
-    
-    def reset(self):
-        """Reset the data loader (creates a new iterator)."""
-        self.iterator = iter(self.dataloader)
-
-# def worker_init_fn(worker_id):
-#     worker_seed = torch.initial_seed() % 2**32
-#     np.random.seed(worker_seed)
-#     random.seed(worker_seed)
+        buf = self.tokens[self.current_position: self.current_position + self.B * self.T + 1]
+        x = buf[:-1].view(self.B, self.T)
+        y = buf[1:].view(self.B, self.T)
+        
+        self.current_position += self.B * self.T * self.total_gpu_across_cluster
+        
+        if self.current_position + (self.B * self.T * self.total_gpu_across_cluster +  1) > len(self.tokens):
+            self.current_position = self.B * self.T * self.global_rank_of_gpu
+        return x, y         
 
 # -----------------------------------------
 # DDP, Device, Seed
@@ -445,18 +302,8 @@ if master_process:
     print(f"total batch size: {total_batch_size}. total fwd&bck in one trip: {(no_of_eg * context_window * ddp_world_size)}, Total grad accum steps: {grad_accum_steps}")  
 # print(f"gpu rank: {ddp_rank}")
 
-# data = Dataloaderlite(batch=no_of_eg, block_size=context_window, global_rank_of_gpu= ddp_rank, total_gpu_across_cluster = ddp_world_size)
-# https://grok.com/share/bGVnYWN5_ef9de139-74dd-40eb-a7ea-b62916fe41ea
-# https://grok.com/chat/d58e0736-dd0b-4164-9adc-b584d4958a3c
-train_loader  = DataLoaderLitePyTorch(
-        B=no_of_eg,              # Batch size
-        T=context_window,           # Sequence length
-        process_rank=ddp_rank,   # Process rank for distributed training
-        num_processes=ddp_world_size,  # Total number of gpus across cluster
-        split="train",    # 'train' or 'val'
-        num_workers=2     # DataLoader workers (0 for single-process)
-    ) 
-val_loader = DataLoaderLitePyTorch(B=no_of_eg, T=context_window, process_rank=ddp_rank, num_processes=ddp_world_size, split="val", num_workers=1)
+data = Dataloaderlite(batch=no_of_eg, block_size=context_window, global_rank_of_gpu= ddp_rank, total_gpu_across_cluster = ddp_world_size)
+ 
 
 # optimizer = torch.optim.AdamW(model.parameters(),lr = 3e-4, betas=(0.9,0.95), eps=1e-8)
 optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)
@@ -467,14 +314,13 @@ for step in range(max_steps):
     optimizer.zero_grad()
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        if ddp: # syncing loss across all gpu in all nodes only on grad_accum_steps -1 steps and not every step. 
-            model.require_backward_grad_sync = (micro_step == (grad_accum_steps -1))
+        x, y = data.next_batch()
         with torch.autocast(device_type=device, dtype=torch.bfloat16):
             logits, loss = model(x, y)
         loss = loss /grad_accum_steps # we do this because in normal F.cross_entropy we take the mean value. here we are accumulating across multiple batches so we devide by no of step we are accumunating by,
         loss_accum += loss.detach()
+        if ddp: # syncing loss across all gpu in all nodes only on grad_accum_steps -1 steps and not every step. 
+            model.require_backward_grad_sync = (micro_step == (grad_accum_steps -1))
         loss.backward()
 
     if ddp:
@@ -489,24 +335,15 @@ for step in range(max_steps):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000 # time diff in ms
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+    tokens_processed = data.B * data.T * grad_accum_steps * ddp_world_size
     tokens_per_second = tokens_processed / (t1 - t0)
     if master_process: 
-        print(f" step {step:5d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}")
+        print(f" step {step} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}")
 
 if ddp:
     destroy_process_group()
     
 print("bye")
-# model = model.to('cpu')
-# del model
-# torch.cuda.empty_cache()
-# print(torch.__version__)
-# import sys;``
-# sys.stdout.flush()
-# sys.stderr.flush()
-# sys.exit(0)
-
 
 # resampling_count = 5
 # max_sample_length=30
