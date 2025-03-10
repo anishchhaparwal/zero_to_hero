@@ -13,6 +13,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 import numpy as np
+import random
 
 @dataclass
 class GPTConfig:
@@ -238,7 +239,7 @@ class FineWebIterableDataset(IterableDataset):
         self.split = split
         self.batch_size = batch_size
         self.block_size = block_size
-        self.process_id = process_id
+        self.process_id = process_id # ddp_rank / global rank
         self.num_processes = num_processes
         
         # Get shard filenames
@@ -261,14 +262,24 @@ class FineWebIterableDataset(IterableDataset):
             num_workers = worker_info.num_workers
         
         # Calculate the effective process ID and total processes
-        effective_process_id = self.process_id * num_workers + worker_id
-        effective_num_processes = self.num_processes * num_workers # previously only one gpu. now each gpu has multiple num_processes so we move those many blocks ahead.
         
+        # to distribute data uniquely across all processes and workers, avoiding overlap.
+        # here effective_process_id is setting the starting point of each iter in a uniform manner on a line that loops.
+        effective_process_id = self.process_id * num_workers + worker_id 
+        
+        # previously only one gpu. now each gpu has multiple num_processes so we move those many blocks ahead.
+        # Total number of gpus across cluster * number of processes per gpu
+        effective_num_processes = self.num_processes * num_workers # total no of processes across all gpus. so think stride.
+       
         # Initial state
         shard_idx = 0
         tokens = np.load(self.shards[shard_idx], mmap_mode='r')
-        position = self.batch_size * self.block_size * effective_process_id
+        position = self.batch_size * self.block_size * effective_process_id 
         
+        
+        # The code has two distinct phases:
+        # Initialization phase: Everything before the while True loop. personal init for each worker.
+        # Working phase: Actual loading of data from shrads.
         while True:
             B, T = self.batch_size, self.block_size
             
@@ -289,7 +300,7 @@ class FineWebIterableDataset(IterableDataset):
                 continue
             
             # Convert to PyTorch tensor
-            buf = torch.tensor(buf_np, dtype=torch.long)
+            buf = torch.tensor(buf_np.astype(np.int32) , dtype=torch.long)
             
             # Create input and target batches (B, T)
             x = buf[:-1].reshape(B, T)
@@ -299,7 +310,6 @@ class FineWebIterableDataset(IterableDataset):
             
             # Advance position for next batch, respecting distributed processes
             position += B * T * effective_num_processes
-
 
 class DataLoaderLitePyTorch:
     """
@@ -344,7 +354,7 @@ class DataLoaderLitePyTorch:
             batch_size=None,  # Already batched in dataset
             num_workers=num_workers,
             pin_memory=torch.cuda.is_available(),
-            # worker_init_fn=worker_init_fn,
+            worker_init_fn=worker_init_fn,
             prefetch_factor=2 if num_workers > 0 else None
         )
         
@@ -364,10 +374,10 @@ class DataLoaderLitePyTorch:
         """Reset the data loader (creates a new iterator)."""
         self.iterator = iter(self.dataloader)
 
-# def worker_init_fn(worker_id):
-#     worker_seed = torch.initial_seed() % 2**32
-#     np.random.seed(worker_seed)
-#     random.seed(worker_seed)
+def worker_init_fn(worker_id):
+    worker_seed = 1337 # torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 # -----------------------------------------
 # DDP, Device, Seed
@@ -406,13 +416,23 @@ else:
 # added after video, pytorch can be serious about it's device vs. device_type distinction
 device_type = "cuda" if device.startswith("cuda") else "cpu"
 
+
+# -----------------------------------------
+# log
+# create the log directory we will write checkpoints to and log to
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f: # open for writing to clear the file
+    pass
+
 # -----------------------------------------
 # get_lr
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10 # 715
-max_steps = 50 # 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+warmup_steps = 140 # 715
+max_steps = 1400 # 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -456,14 +476,76 @@ train_loader  = DataLoaderLitePyTorch(
         split="train",    # 'train' or 'val'
         num_workers=2     # DataLoader workers (0 for single-process)
     ) 
-val_loader = DataLoaderLitePyTorch(B=no_of_eg, T=context_window, process_rank=ddp_rank, num_processes=ddp_world_size, split="val", num_workers=1)
+val_loader = DataLoaderLitePyTorch(B=no_of_eg, T=context_window, process_rank=ddp_rank, num_processes=ddp_world_size, split="val", num_workers=2)
 
 # optimizer = torch.optim.AdamW(model.parameters(),lr = 3e-4, betas=(0.9,0.95), eps=1e-8)
 optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)
 
+# -----------------------------------------
+# evaluate_model
+# def save_checkpoint(model, optimizer, step, val_loss, log_dir):
+#     """
+#     Save model checkpoint.
+    
+#     Args:
+#         model: The raw model (not DDP wrapped)
+#         optimizer: The optimizer
+#         step: Current training step
+#         val_loss: Validation loss
+#         log_dir: Directory to save checkpoint to
+#     """
+#     checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+#     checkpoint = {
+#         'model': model.state_dict(),
+#         'config': model.config,
+#         'optimizer': optimizer.state_dict(),
+#         'step': step,
+#         'val_loss': val_loss
+#     }
+#     torch.save(checkpoint, checkpoint_path)
+#     print(f"Saved checkpoint to {checkpoint_path}")
+
+
 # training steps
 for step in range(max_steps):
     t0=time.time()
+    last_step = (step == max_steps - 1)
+    
+    # Validation and checkpoint logic
+    # once in a while evaluate our validation loss
+    if step % 250 == 0 or last_step:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+            if step > 0 and (step % 500 == 0 or last_step):
+                # optionally write model checkpoints
+                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'config': raw_model.config,
+                    'step': step,
+                    'val_loss': val_loss_accum.item()
+                }
+                # you might also want to add optimizer.state_dict() and
+                # rng seeds etc., if you wanted to more exactly resume training
+                torch.save(checkpoint, checkpoint_path)
+    
+    model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
@@ -473,6 +555,11 @@ for step in range(max_steps):
             model.require_backward_grad_sync = (micro_step == (grad_accum_steps -1))
         with torch.autocast(device_type=device, dtype=torch.bfloat16):
             logits, loss = model(x, y)
+            
+        # we have to scale the loss to account for gradient accumulation,
+        # because the gradients just add on each successive backward().
+        # addition of gradients corresponds to a SUM in the objective, but
+        # instead of a SUM we want MEAN. Scale the loss here so it comes out right
         loss = loss /grad_accum_steps # we do this because in normal F.cross_entropy we take the mean value. here we are accumulating across multiple batches so we devide by no of step we are accumunating by,
         loss_accum += loss.detach()
         loss.backward()
@@ -493,7 +580,9 @@ for step in range(max_steps):
     tokens_per_second = tokens_processed / (t1 - t0)
     if master_process: 
         print(f" step {step:5d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}")
-
+        with open(log_file, "a") as f:
+            f.write(f"{step} train {loss_accum.item():.6f}\n")
+    
 if ddp:
     destroy_process_group()
     
