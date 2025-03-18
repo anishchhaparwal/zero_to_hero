@@ -1,3 +1,5 @@
+# numactl --physcpubind=64-96 torchrun --standalone --nproc_per_node=3 trainer.py
+
 from dataclasses import dataclass
 import math
 import tiktoken
@@ -14,7 +16,6 @@ import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 import numpy as np
 import random
-from clearml import Task
 
 @dataclass
 class GPTConfig:
@@ -194,6 +195,25 @@ class GPT(nn.Module):
         # print(f"num decayed: {sum(p.numel() for p in decay_params):,} | num non-decayed: {sum(p.numel() for p in nondecay_params):,} | setting fused in optim to: {fused_available}")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9,0.95), eps=1e-8, fused=fused_available)
         return optimizer
+        
+    def get_num_params(self):
+        """Return the number of parameters in the model."""
+        return sum(p.numel() for p in self.parameters())
+        
+    def estimate_mfu(self, fwdbwd_per_iter, dt, world_size=1):
+        """Estimate model flops utilization (MFU) in units of 3090 GPU FLOPs."""
+        # First estimate the number of flops we do per iteration
+        N = self.get_num_params()
+        cfg = self.config
+        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
+        flops_per_token = 6*N + 12*L*H*Q*T
+        flops_per_fwdbwd = flops_per_token * T
+        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+        # Express flops throughput as ratio of 3090 FLOPs peak
+        flops_achieved = flops_per_iter * (1.0/dt)  # per second
+        flops_promised = 142e12  # 142 TFLOPS per 3090 GPU
+        mfu = flops_achieved / flops_promised
+        return mfu
 
 class FineWebIterableDataset(IterableDataset):
     """PyTorch IterableDataset for FineWeb data that yields batches continuously."""
@@ -346,8 +366,9 @@ def worker_init_fn(worker_id):
     random.seed(worker_seed)
 
 # -----------------------------------------
-# logging  
-task = Task.init(project_name='testing', task_name='test_run_1')
+# Performance metrics tracking
+tokens_per_second_history = []
+mfu_history = []
 
 # -----------------------------------------
 # DDP, Device, Seed
@@ -403,6 +424,7 @@ max_lr = 6e-4 * 3
 min_lr = max_lr * 0.1
 warmup_steps = 620 # 715
 max_steps = 17000 # 19073 # 16,955 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+max_steps = 170
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -444,7 +466,7 @@ train_loader  = DataLoaderLitePyTorch(
         process_rank=ddp_rank,   # Process rank for distributed training
         num_processes=ddp_world_size,  # Total number of gpus across cluster
         split="train",    # 'train' or 'val'
-        num_workers=2     # DataLoader workers (0 for single-process)
+        num_workers=8     # DataLoader workers (0 for single-process)
     ) 
 val_loader = DataLoaderLitePyTorch(B=no_of_eg, T=context_window, process_rank=ddp_rank, num_processes=ddp_world_size, split="val", num_workers=2)
 
@@ -483,7 +505,7 @@ for step in range(max_steps):
     
     # Validation and checkpoint logic
     # once in a while evaluate our validation loss
-    if step % 250 == 0 or last_step:
+    if step % 25 == 0 or last_step:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
@@ -502,6 +524,20 @@ for step in range(max_steps):
             print(f"validation loss: {val_loss_accum.item():.4f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+                
+            # If we have performance metrics, report a summary
+            if len(tokens_per_second_history) > 0:
+                # Calculate performance stats
+                avg_tokens_per_second = sum(tokens_per_second_history) / len(tokens_per_second_history)
+                avg_mfu = sum(mfu_history) / len(mfu_history)
+                max_tokens_per_second = max(tokens_per_second_history)
+                max_mfu = max(mfu_history)
+                
+                # Log summary
+                print(f"\nPERFORMANCE SUMMARY at step {step}:")
+                print(f"Avg tokens/sec: {avg_tokens_per_second:.2f} | Max tokens/sec: {max_tokens_per_second:.2f}")
+                print(f"Avg MFU: {avg_mfu:.2%} | Max MFU: {max_mfu:.2%}")
+                
             if step > 0 and (step % 500 == 0 or last_step):
                 # optionally write model checkpoints
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
@@ -548,10 +584,22 @@ for step in range(max_steps):
     dt = (t1 - t0) * 1000 # time diff in ms
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_second = tokens_processed / (t1 - t0)
-    if master_process: 
-        print(f" step {step:5d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}")
+    
+    if master_process:
+        # Calculate MFU
+        mfu = raw_model.estimate_mfu(fwdbwd_per_iter=train_loader.B * grad_accum_steps, dt=t1-t0, world_size=ddp_world_size)
+        tokens_per_second_history.append(tokens_per_second)
+        mfu_history.append(mfu)
+        
+        # Calculate rolling averages over last 50 steps
+        window_size = min(50, len(tokens_per_second_history))
+        avg_tokens_per_second = sum(tokens_per_second_history[-window_size:]) / window_size
+        avg_mfu = sum(mfu_history[-window_size:]) / window_size
+        
+        # Print to console
+        print(f" step {step:5d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f} | avg tok/sec: {avg_tokens_per_second:.2f} | MFU: {mfu:.2%}")
         with open(log_file, "a") as f:
-            f.write(f"{step} train {loss_accum.item():.6f}\n")
+            f.write(f"{step} train loss={loss_accum.item():.6f} tok_per_sec={tokens_per_second:.2f} avg_tok_per_sec={avg_tokens_per_second:.2f} mfu={mfu:.6f} avg_mfu={avg_mfu:.6f}\n")
     
 if ddp:
     destroy_process_group()
