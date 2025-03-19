@@ -16,6 +16,8 @@ import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 import numpy as np
 import random
+import matplotlib.pyplot as plt
+from torch.utils.tensorboard import SummaryWriter
 
 @dataclass
 class GPTConfig:
@@ -413,9 +415,85 @@ device_type = "cuda" if device.startswith("cuda") else "cpu"
 # create the log directory we will write checkpoints to and log to
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
+# Create histograms directory
+if master_process:
+    os.makedirs(os.path.join(log_dir, "histograms"), exist_ok=True)
+    tb_writer = SummaryWriter(log_dir)
 log_file = os.path.join(log_dir, f"log.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
     pass
+
+def log_histograms(model, step, log_dir, tb_writer=None):
+    """
+    Log histograms of model parameters and gradients.
+    Simple approach without hooks to visualize weight and gradient distributions.
+    """
+    # Skip if not running on master process
+    if not master_process:
+        return
+        
+    # Group parameters by type for plotting
+    weights_dict = {}
+    grads_dict = {}
+    
+    # Collect parameters and gradients from key layers
+    sample_count = 0
+    for name, param in model.named_parameters():
+        if param.requires_grad and param.ndim == 2:  # Only matrix params
+            # Select representative layers to avoid too many histograms
+            if ('h.0.' in name or 'h.5.' in name or 'h.11.' in name or 
+                'wte' in name or 'lm_head' in name):
+                
+                # Add param to weights dict
+                weights_dict[name] = param.detach().cpu().float()
+                
+                # Add gradient to grads dict if available
+                if param.grad is not None:
+                    grads_dict[name] = param.grad.detach().cpu().float()
+                    
+                    # Print statistics like in the example
+                    print(f'weight {name}: mean {param.mean().item():+.4f}, std {param.std().item():.4e}, '
+                          f'grad:data ratio {param.grad.std().item() / param.std().item():.4e}')
+                
+                sample_count += 1
+                if sample_count >= 8:  # Limit number of histograms for clarity
+                    break
+    
+    # Plot weight distributions (multiple on same graph)
+    if weights_dict:
+        plt.figure(figsize=(20, 8))
+        for name, param in weights_dict.items():
+            hy, hx = torch.histogram(param.flatten(), bins=50, density=True)
+            plt.plot(hx[:-1].detach(), hy.detach())
+        plt.legend(list(weights_dict.keys()), fontsize='small')
+        plt.title(f'Weight Distribution (Step {step})')
+        plt.xlabel('Weight Value')
+        plt.ylabel('Density')
+        plt.grid(alpha=0.3)
+        plt.savefig(os.path.join(log_dir, f"histograms/weights_{step}.png"))
+        plt.close()
+    
+    # Plot gradient distributions (multiple on same graph)
+    if grads_dict:
+        plt.figure(figsize=(20, 8))
+        for name, grad in grads_dict.items():
+            hy, hx = torch.histogram(grad.flatten(), bins=50, density=True)
+            plt.plot(hx[:-1].detach(), hy.detach())
+        plt.legend(list(grads_dict.keys()), fontsize='small')
+        plt.title(f'Gradient Distribution (Step {step})')
+        plt.xlabel('Gradient Value')
+        plt.ylabel('Density')
+        plt.grid(alpha=0.3)
+        plt.savefig(os.path.join(log_dir, f"histograms/gradients_{step}.png"))
+        plt.close()
+    
+    # Log to TensorBoard if provided
+    if tb_writer:
+        for name, param in weights_dict.items():
+            tb_writer.add_histogram(f"weights/{name}", param, step)
+        
+        for name, grad in grads_dict.items():
+            tb_writer.add_histogram(f"gradients/{name}", grad, step)
 
 # -----------------------------------------
 # get_lr
@@ -524,6 +602,14 @@ for step in range(max_steps):
             print(f"validation loss: {val_loss_accum.item():.4f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+            
+            # Log to TensorBoard
+            if 'tb_writer' in locals() or 'tb_writer' in globals():
+                tb_writer.add_scalar("loss/val", val_loss_accum.item(), step)
+            
+            # Log histograms less frequently to avoid overhead
+            if step % 100 == 0 or last_step:
+                log_histograms(raw_model, step, log_dir, tb_writer if 'tb_writer' in locals() or 'tb_writer' in globals() else None)
                 
             # If we have performance metrics, report a summary
             if len(tokens_per_second_history) > 0:
@@ -600,6 +686,18 @@ for step in range(max_steps):
         print(f" step {step:5d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f} | avg tok/sec: {avg_tokens_per_second:.2f} | MFU: {mfu:.2%}")
         with open(log_file, "a") as f:
             f.write(f"{step} train loss={loss_accum.item():.6f} tok_per_sec={tokens_per_second:.2f} avg_tok_per_sec={avg_tokens_per_second:.2f} mfu={mfu:.6f} avg_mfu={avg_mfu:.6f}\n")
+        
+        # Log to TensorBoard
+        if 'tb_writer' in locals() or 'tb_writer' in globals():
+            tb_writer.add_scalar("loss/train", loss_accum.item(), step)
+            tb_writer.add_scalar("lr", lr, step)
+            tb_writer.add_scalar("grad_norm", norm, step)
+            tb_writer.add_scalar("performance/tokens_per_second", tokens_per_second, step)
+            tb_writer.add_scalar("performance/mfu", mfu, step)
     
 if ddp:
     destroy_process_group()
+
+# Close TensorBoard writer
+if master_process and 'tb_writer' in locals():
+    tb_writer.close()
