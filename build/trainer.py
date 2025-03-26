@@ -18,15 +18,8 @@ import numpy as np
 import random
 import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
-
-@dataclass
-class GPTConfig:
-    block_size:int = 1024
-    vocab_size:int = 50257  # ugly number we want to replace with a power of 2. eg: 50304  
-    n_layer:int = 12 # no of attention block
-    n_head:int = 12 # attention head
-    n_embd:int = 768 # embedding size
-    
+from clearml import Task
+   
 class CausalAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -413,6 +406,9 @@ device_type = "cuda" if device.startswith("cuda") else "cpu"
 # -----------------------------------------
 # log
 # create the log directory we will write checkpoints to and log to
+task = Task.init(project_name='testing', task_name='test_run_2')
+
+
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
 # Create histograms directory
@@ -424,85 +420,72 @@ with open(log_file, "w") as f: # open for writing to clear the file
     pass
 
 def log_histograms(model, step, log_dir, tb_writer=None):
-    """
-    Log histograms of model parameters and gradients.
-    Simple approach without hooks to visualize weight and gradient distributions.
-    """
-    # Skip if not running on master process
     if not master_process:
         return
-        
-    # Group parameters by type for plotting
-    weights_dict = {}
-    grads_dict = {}
-    
-    # Collect parameters and gradients from key layers
-    sample_count = 0
-    for name, param in model.named_parameters():
-        if param.requires_grad and param.ndim == 2:  # Only matrix params
-            # Select representative layers to avoid too many histograms
-            if ('h.0.' in name or 'h.5.' in name or 'h.11.' in name or 
-                'wte' in name or 'lm_head' in name):
-                
-                # Add param to weights dict
-                weights_dict[name] = param.detach().cpu().float()
-                
-                # Add gradient to grads dict if available
-                if param.grad is not None:
-                    grads_dict[name] = param.grad.detach().cpu().float()
-                    
-                    # Print statistics like in the example
-                    print(f'weight {name}: mean {param.mean().item():+.4f}, std {param.std().item():.4e}, '
-                          f'grad:data ratio {param.grad.std().item() / param.std().item():.4e}')
-                
-                sample_count += 1
-                if sample_count >= 8:  # Limit number of histograms for clarity
-                    break
-    
-    # Plot weight distributions (multiple on same graph)
-    if weights_dict:
-        plt.figure(figsize=(20, 8))
-        for name, param in weights_dict.items():
-            hy, hx = torch.histogram(param.flatten(), bins=50, density=True)
-            plt.plot(hx[:-1].detach(), hy.detach())
-        plt.legend(list(weights_dict.keys()), fontsize='small')
-        plt.title(f'Weight Distribution (Step {step})')
-        plt.xlabel('Weight Value')
-        plt.ylabel('Density')
-        plt.grid(alpha=0.3)
-        plt.savefig(os.path.join(log_dir, f"histograms/weights_{step}.png"))
-        plt.close()
-    
-    # Plot gradient distributions (multiple on same graph)
-    if grads_dict:
-        plt.figure(figsize=(20, 8))
-        for name, grad in grads_dict.items():
-            hy, hx = torch.histogram(grad.flatten(), bins=50, density=True)
-            plt.plot(hx[:-1].detach(), hy.detach())
-        plt.legend(list(grads_dict.keys()), fontsize='small')
-        plt.title(f'Gradient Distribution (Step {step})')
-        plt.xlabel('Gradient Value')
-        plt.ylabel('Density')
-        plt.grid(alpha=0.3)
-        plt.savefig(os.path.join(log_dir, f"histograms/gradients_{step}.png"))
-        plt.close()
-    
-    # Log to TensorBoard if provided
-    if tb_writer:
-        for name, param in weights_dict.items():
-            tb_writer.add_histogram(f"weights/{name}", param, step)
-        
-        for name, grad in grads_dict.items():
-            tb_writer.add_histogram(f"gradients/{name}", grad, step)
 
+    logger_dict = {}
+    layer_types = {'attention': [], 'mlp': [], 'embeddings': []}
+
+    for name, param in model.named_parameters():
+        if param.requires_grad and param.ndim >= 2:
+            if 'h.0.' in name or 'h.5.' in name or 'h.11.' in name or 'wte' in name or 'lm_head' in name:
+                stats = {'weight_mean': param.mean().item(), 'weight_std': param.std().item()}
+                if param.grad is not None:
+                    stats.update({
+                        'grad_mean': param.grad.mean().item(),
+                        'grad_std': param.grad.std().item(),
+                        'ratio': param.grad.std().item() / param.std().item()
+                    })
+                logger_dict[name] = stats
+                if 'attn' in name:
+                    layer_types['attention'].append(stats)
+                elif 'mlp' in name:
+                    layer_types['mlp'].append(stats)
+                else:
+                    layer_types['embeddings'].append(stats)
+
+    # Print averages per layer type
+    for layer_type, stats_list in layer_types.items():
+        if stats_list:
+            avg_weight_std = sum(s['weight_std'] for s in stats_list) / len(stats_list)
+            avg_grad_std = sum(s['grad_std'] for s in stats_list if 'grad_std' in s) / len([s for s in stats_list if 'grad_std' in s]) if any('grad_std' in s for s in stats_list) else 0
+            avg_ratio = sum(s['ratio'] for s in stats_list if 'ratio' in s) / len([s for s in stats_list if 'ratio' in s]) if any('ratio' in s for s in stats_list) else 0
+            print(f"{layer_type}: avg weight std {avg_weight_std:.4e}, avg grad std {avg_grad_std:.4e}, avg ratio {avg_ratio:.4e}")
+
+    # Plot with color-coding
+    import matplotlib.pyplot as plt
+    import math
+    plt.figure(figsize=(20, 4))
+    colors = {'h.0.': 'blue', 'h.5.': 'green', 'h.11.': 'red', 'wte': 'purple', 'lm_head': 'orange'}
+    for i, (name, stats) in enumerate(logger_dict.items()):
+        if 'ratio' in stats:
+            layer_key = next((key for key in colors if key in name), 'gray')
+            plt.scatter(i, math.log10(stats['ratio']), marker='o', color=colors.get(layer_key, 'gray'))
+    plt.axhline(y=-3, color='k', linestyle='-', label='Target ratio (1e-3)')
+    plt.legend(list(colors.keys()) + ['Target ratio (1e-3)'], fontsize='small')
+    plt.title(f'Gradient:Parameter Ratio Distribution (Step {step})')
+    plt.ylabel('Log10(Gradient:Parameter Ratio)')
+    plt.grid(alpha=0.3)
+    plt.savefig(os.path.join(log_dir, f"histograms/grad_param_ratio_{step}.png"))
+    plt.close()
+
+    # TensorBoard logging
+    if tb_writer:
+        for name, stats in logger_dict.items():
+            tb_writer.add_scalar(f"weights/mean/{name}", stats['weight_mean'], step)
+            tb_writer.add_scalar(f"weights/std/{name}", stats['weight_std'], step)
+            if 'grad_mean' in stats:
+                tb_writer.add_scalar(f"grads/mean/{name}", stats['grad_mean'], step)
+                tb_writer.add_scalar(f"grads/std/{name}", stats['grad_std'], step)
+                tb_writer.add_scalar(f"grad_param_ratio/{name}", stats['ratio'], step)
 # -----------------------------------------
 # get_lr
-
-max_lr = 6e-4 * 3
-min_lr = max_lr * 0.1
-warmup_steps = 620 # 715
 max_steps = 17000 # 19073 # 16,955 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 max_steps = 170
+max_lr = 6e-4 * 3
+min_lr = max_lr * 0.1
+warmup_steps = min(620,int(max_steps*0.1)) # 715
+
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -517,8 +500,21 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 # -----------------------------------------
+@dataclass
+class GPTConfig:
+    block_size:int = 1024
+    vocab_size:int = 50257  # ugly number we want to replace with a power of 2. eg: 50304  
+    n_layer:int = 12 # no of attention block
+    n_head:int = 12 # attention head
+    n_embd:int = 768 # embedding size
+    
 # model init
-model = GPT(GPTConfig(vocab_size=50304))
+total_batch_size  = 589824 #540672 #2**19
+no_of_eg = 16
+context_window = 1024
+
+
+model = GPT(GPTConfig(vocab_size=50304, block_size=context_window))
 model.eval()
 model.to(device)
 model = torch.compile(model)
@@ -526,9 +522,7 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model
 
-total_batch_size  = 589824 #540672 #2**19
-no_of_eg = 16
-context_window = 1024
+
 assert total_batch_size % (no_of_eg * context_window * ddp_world_size) == 0, "make total_batch_size divisible by no_of_eg * context_window * ddp_world_size"
 grad_accum_steps = total_batch_size // (no_of_eg * context_window * ddp_world_size)
 if master_process:
@@ -610,7 +604,7 @@ for step in range(max_steps):
             # Log histograms less frequently to avoid overhead
             if step % 100 == 0 or last_step:
                 log_histograms(raw_model, step, log_dir, tb_writer if 'tb_writer' in locals() or 'tb_writer' in globals() else None)
-                
+
             # If we have performance metrics, report a summary
             if len(tokens_per_second_history) > 0:
                 # Calculate performance stats
