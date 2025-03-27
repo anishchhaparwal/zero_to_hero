@@ -406,10 +406,10 @@ device_type = "cuda" if device.startswith("cuda") else "cpu"
 # -----------------------------------------
 # log
 # create the log directory we will write checkpoints to and log to
-task = Task.init(project_name='testing', task_name='test_run_2')
+task = Task.init(project_name='testing', task_name='test_run_5')
 
 
-log_dir = "log"
+log_dir = "/cache/fast_data_nas8/llm_setup_dataset/model_runs/run_3"
 os.makedirs(log_dir, exist_ok=True)
 # Create histograms directory
 if master_process:
@@ -452,23 +452,6 @@ def log_histograms(model, step, log_dir, tb_writer=None):
             avg_ratio = sum(s['ratio'] for s in stats_list if 'ratio' in s) / len([s for s in stats_list if 'ratio' in s]) if any('ratio' in s for s in stats_list) else 0
             print(f"{layer_type}: avg weight std {avg_weight_std:.4e}, avg grad std {avg_grad_std:.4e}, avg ratio {avg_ratio:.4e}")
 
-    # Plot with color-coding
-    import matplotlib.pyplot as plt
-    import math
-    plt.figure(figsize=(20, 4))
-    colors = {'h.0.': 'blue', 'h.5.': 'green', 'h.11.': 'red', 'wte': 'purple', 'lm_head': 'orange'}
-    for i, (name, stats) in enumerate(logger_dict.items()):
-        if 'ratio' in stats:
-            layer_key = next((key for key in colors if key in name), 'gray')
-            plt.scatter(i, math.log10(stats['ratio']), marker='o', color=colors.get(layer_key, 'gray'))
-    plt.axhline(y=-3, color='k', linestyle='-', label='Target ratio (1e-3)')
-    plt.legend(list(colors.keys()) + ['Target ratio (1e-3)'], fontsize='small')
-    plt.title(f'Gradient:Parameter Ratio Distribution (Step {step})')
-    plt.ylabel('Log10(Gradient:Parameter Ratio)')
-    plt.grid(alpha=0.3)
-    plt.savefig(os.path.join(log_dir, f"histograms/grad_param_ratio_{step}.png"))
-    plt.close()
-
     # TensorBoard logging
     if tb_writer:
         for name, stats in logger_dict.items():
@@ -478,10 +461,12 @@ def log_histograms(model, step, log_dir, tb_writer=None):
                 tb_writer.add_scalar(f"grads/mean/{name}", stats['grad_mean'], step)
                 tb_writer.add_scalar(f"grads/std/{name}", stats['grad_std'], step)
                 tb_writer.add_scalar(f"grad_param_ratio/{name}", stats['ratio'], step)
+                # Log the target ratio as a reference line
+                tb_writer.add_scalar("grad_param_ratio/target", 1e-3, step)
 # -----------------------------------------
 # get_lr
 max_steps = 17000 # 19073 # 16,955 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
-max_steps = 170
+max_steps = 1700
 max_lr = 6e-4 * 3
 min_lr = max_lr * 0.1
 warmup_steps = min(620,int(max_steps*0.1)) # 715
@@ -547,27 +532,27 @@ optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, 
 
 # -----------------------------------------
 # evaluate_model
-# def save_checkpoint(model, optimizer, step, val_loss, log_dir):
-#     """
-#     Save model checkpoint.
+def save_checkpoint(model, optimizer, step, val_loss, log_dir):
+    """
+    Save model checkpoint.
     
-#     Args:
-#         model: The raw model (not DDP wrapped)
-#         optimizer: The optimizer
-#         step: Current training step
-#         val_loss: Validation loss
-#         log_dir: Directory to save checkpoint to
-#     """
-#     checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
-#     checkpoint = {
-#         'model': model.state_dict(),
-#         'config': model.config,
-#         'optimizer': optimizer.state_dict(),
-#         'step': step,
-#         'val_loss': val_loss
-#     }
-#     torch.save(checkpoint, checkpoint_path)
-#     print(f"Saved checkpoint to {checkpoint_path}")
+    Args:
+        model: The raw model (not DDP wrapped)
+        optimizer: The optimizer
+        step: Current training step
+        val_loss: Validation loss
+        log_dir: Directory to save checkpoint to
+    """
+    checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+    checkpoint = {
+        'model': model.state_dict(),
+        'config': model.config,
+        'optimizer': optimizer.state_dict(),
+        'step': step,
+        'val_loss': val_loss
+    }
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Saved checkpoint to {checkpoint_path}")
 
 
 # training steps
@@ -600,6 +585,7 @@ for step in range(max_steps):
             # Log to TensorBoard
             if 'tb_writer' in locals() or 'tb_writer' in globals():
                 tb_writer.add_scalar("loss/val", val_loss_accum.item(), step)
+                
             
             # Log histograms less frequently to avoid overhead
             if step % 100 == 0 or last_step:
@@ -619,18 +605,10 @@ for step in range(max_steps):
                 print(f"Avg MFU: {avg_mfu:.2%} | Max MFU: {max_mfu:.2%}")
                 
             if step > 0 and (step % 500 == 0 or last_step):
-                # optionally write model checkpoints
-                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'config': raw_model.config,
-                    'step': step,
-                    'val_loss': val_loss_accum.item()
-                }
-                # you might also want to add optimizer.state_dict() and
-                # rng seeds etc., if you wanted to more exactly resume training
-                torch.save(checkpoint, checkpoint_path)
-    
+                save_checkpoint(
+                    model=raw_model,  # Use raw_model, not DDP-wrapped model
+                    optimizer=optimizer, step=step, val_loss=val_loss_accum.item(), log_dir=log_dir )
+
     model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
@@ -684,6 +662,7 @@ for step in range(max_steps):
         # Log to TensorBoard
         if 'tb_writer' in locals() or 'tb_writer' in globals():
             tb_writer.add_scalar("loss/train", loss_accum.item(), step)
+            tb_writer.add_scalar("loss/reference_gpt2_target", 2.85, step) # GPT-2 target is 2.85
             tb_writer.add_scalar("lr", lr, step)
             tb_writer.add_scalar("grad_norm", norm, step)
             tb_writer.add_scalar("performance/tokens_per_second", tokens_per_second, step)
